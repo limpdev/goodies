@@ -12,6 +12,7 @@ ui/
 *.syso
 lightpanda
 .goodies.yaml
+goodies
 
 # Logs & environment
 logs
