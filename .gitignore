@@ -11,6 +11,7 @@ pids
 ui/
 *.syso
 lightpanda
+.goodies.yaml
 
 # Logs & environment
 logs
