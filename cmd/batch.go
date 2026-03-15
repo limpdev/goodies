@@ -73,7 +73,8 @@ func runBatch(cmd *cobra.Command, args []string) error {
 		TargetSelector: selector,
 		Parallelism:    2,
 		OutputFormat:   scraperFormat,
-		CookieFile:     cookieFile, // Use the global cookie flag
+		CookieFile:     cookieFile,
+		LightpandaURL:  getLightpandaURL(),
 	}
 
 	fmt.Println("Starting scraper...")

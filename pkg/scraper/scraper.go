@@ -34,6 +34,7 @@ type GollyArgs struct {
 	EnableDebug    bool              `json:"enable_debug"`
 	AllowedDomains []string          `json:"allowed_domains"`
 	CookieFile     string            `json:"cookie_file"`
+	LightpandaURL  string            `json:"lightpanda_url"`
 }
 
 type ScrapedData struct {
@@ -339,10 +340,10 @@ func (s *Scraper) discoverCDPEndpoint(baseURL string) (string, error) {
 }
 
 func (s *Scraper) fetchWithLightpanda(targetURL string) (string, error) {
-	// FIX (Bug 3): Proper endpoint discovery
-	cdpURL := os.Getenv("LIGHTPANDA_CDP_URL")
+	cdpURL := os.Getenv("LIGHTPANDA_CDP_URL") // direct WS override still works
 	if cdpURL == "" {
-		httpBase := os.Getenv("LIGHTPANDA_HTTP_URL")
+		// Use the config-resolved HTTP base URL for discovery
+		httpBase := s.Config.LightpandaURL
 		if httpBase == "" {
 			httpBase = "http://127.0.0.1:9222"
 		}
