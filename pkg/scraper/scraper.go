@@ -23,6 +23,10 @@ import (
 	"github.com/gocolly/colly/v2/debug"
 )
 
+// -----------------------------------------------------------------------------
+// TYPES
+// -----------------------------------------------------------------------------
+
 type GollyArgs struct {
 	URLs           []string          `json:"urls"`
 	UserAgent      string            `json:"user_agent"`
@@ -34,7 +38,7 @@ type GollyArgs struct {
 	EnableDebug    bool              `json:"enable_debug"`
 	AllowedDomains []string          `json:"allowed_domains"`
 	CookieFile     string            `json:"cookie_file"`
-	LightpandaURL  string            `json:"lightpanda_url"`
+	ChromeBin      string            `json:"chrome_bin"` // path to Chrome/Chromium binary; empty = disabled
 }
 
 type ScrapedData struct {
@@ -60,25 +64,31 @@ type Scraper struct {
 	Collector *colly.Collector
 	Results   []ScrapedData
 	mu        sync.Mutex
-	errors    []error // FIX (Bug 2): collect errors from callbacks
+	errors    []error
+
+	// chromedp allocator — created once, shared across all fetchWithChromedp calls.
+	// nil when ChromeBin is empty (JS rendering disabled).
+	allocatorCtx    context.Context
+	allocatorCancel context.CancelFunc
 }
+
+// -----------------------------------------------------------------------------
+// CONSTRUCTOR / LIFECYCLE
+// -----------------------------------------------------------------------------
 
 func NewScraper(config *GollyArgs) *Scraper {
 	c := colly.NewCollector(
 		colly.UserAgent(config.UserAgent),
 		colly.Async(true),
 	)
-
 	if len(config.AllowedDomains) > 0 {
 		c.AllowedDomains = config.AllowedDomains
 	}
-
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: config.Parallelism,
 		Delay:       config.Delay,
 	})
-
 	if config.EnableDebug {
 		c.SetDebugger(&debug.LogDebugger{})
 	}
@@ -98,48 +108,75 @@ func NewScraper(config *GollyArgs) *Scraper {
 		}
 	}
 
+	// Build the shared chromedp exec allocator now so we pay the startup cost
+	// once rather than once-per-URL. Only initialised when a binary is configured.
+	if config.ChromeBin != "" {
+		opts := append(
+			chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.ExecPath(config.ChromeBin),
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+		)
+		allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
+		s.allocatorCtx = allocCtx
+		s.allocatorCancel = allocCancel
+		log.Printf("chromedp allocator initialised with binary: %s", config.ChromeBin)
+	}
+
 	return s
 }
 
+// Close tears down the shared chromedp allocator. Call this when the Scraper
+// is no longer needed (typically deferred right after NewScraper).
+func (s *Scraper) Close() {
+	if s.allocatorCancel != nil {
+		s.allocatorCancel()
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SCRAPE ENTRY POINT
+// -----------------------------------------------------------------------------
+
 func (s *Scraper) Scrape() error {
 	s.setupCallbacks()
-
-	// FIX (Bug 1): Check Visit() errors and handle redirect domains
 	for _, urlStr := range s.Config.URLs {
 		if err := s.Collector.Visit(urlStr); err != nil {
 			log.Printf("Visit failed for %s: %v", urlStr, err)
-
-			// FIX (Bug 6): If it's a domain issue, try adding www/non-www variant
 			if err.Error() == "Forbidden domain" {
 				log.Printf("Hint: The URL may redirect to a different domain. Check AllowedDomains.")
 			}
-
 			s.mu.Lock()
 			s.errors = append(s.errors, fmt.Errorf("visit %s: %w", urlStr, err))
 			s.mu.Unlock()
 		}
 	}
-
 	s.Collector.Wait()
-
-	// FIX (Bug 2): Surface errors if we got zero results
 	if len(s.Results) == 0 && len(s.errors) > 0 {
 		return fmt.Errorf("scrape failed — first error: %w", s.errors[0])
 	}
-
 	return nil
 }
 
-// -----------------------------------------------------------------------------
-// PARSER PROCESSING LOGIC
-// -----------------------------------------------------------------------------
+// ScrapeChan is the streaming counterpart to Scrape. It dispatches each
+// completed ScrapedData onto results as soon as it is ready, rather than
+// accumulating everything before returning. The caller must drain results
+// concurrently; ScrapeChan closes the channel before returning.
+//
+// Errors that prevent a URL from producing any content at all are sent on
+// the separate errs channel as ScrapeError values so the caller can write
+// .err files or log them without blocking the result stream.
+//
+// ScrapeChan does not populate s.Results — use Scrape() when you need that.
+func (s *Scraper) ScrapeChan(results chan<- ScrapedData, errs chan<- ScrapeError) {
+	defer close(results)
+	defer close(errs)
 
-func (s *Scraper) setupCallbacks() {
-	// FIX (Bug 6): Follow redirects to other domains automatically
+	// redirect handler — same logic as setupCallbacks
 	s.Collector.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
-		// Add the redirect target's hostname to AllowedDomains dynamically
 		newHost := req.URL.Hostname()
-
 		allowed := false
 		for _, d := range s.Collector.AllowedDomains {
 			if d == newHost {
@@ -151,7 +188,6 @@ func (s *Scraper) setupCallbacks() {
 			log.Printf("Adding redirect domain to AllowedDomains: %s", newHost)
 			s.Collector.AllowedDomains = append(s.Collector.AllowedDomains, newHost)
 		}
-
 		if len(via) >= 10 {
 			return fmt.Errorf("too many redirects")
 		}
@@ -159,11 +195,115 @@ func (s *Scraper) setupCallbacks() {
 	})
 
 	s.Collector.OnHTML("html", func(e *colly.HTMLElement) {
-		// FIX (Bug 4): Recover from any panic inside the callback
+		reqURL := e.Request.URL.String()
+
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("RECOVERED panic in OnHTML callback for %s: %v", reqURL, r)
+				// Best-effort: send whatever static parse we can get.
+				data := s.parseDOM(e.DOM, reqURL)
+				results <- data
+			}
+		}()
+
+		requiresJSFallback := false
+		selection := e.DOM
+
+		if s.Config.TargetSelector != "" {
+			if e.DOM.Find(s.Config.TargetSelector).Length() == 0 {
+				requiresJSFallback = true
+			}
+		} else {
+			bodyText := strings.TrimSpace(e.DOM.Find("body").Text())
+			hasJSFrameworkMarker := e.DOM.Find(`div#root, div#app, div#__next, div[data-reactroot]`).Length() > 0
+			if len(bodyText) < 200 && hasJSFrameworkMarker {
+				requiresJSFallback = true
+			}
+		}
+
+		if requiresJSFallback {
+			if s.allocatorCtx == nil {
+				log.Printf("JS rendering needed for %s but no Chrome binary configured — using static HTML", reqURL)
+			} else {
+				log.Printf("JS rendering needed for %s — handing off to chromedp...", reqURL)
+				renderedHTML, err := s.fetchWithChromedp(reqURL)
+				if err != nil {
+					log.Printf("chromedp fallback failed for %s: %v — using static HTML", reqURL, err)
+				} else if renderedHTML != "" {
+					doc, parseErr := goquery.NewDocumentFromReader(strings.NewReader(renderedHTML))
+					if parseErr == nil {
+						htmlSel := doc.Find("html")
+						if htmlSel.Length() > 0 {
+							selection = htmlSel
+						} else {
+							selection = doc.Selection
+						}
+						log.Printf("chromedp successfully rendered %s", reqURL)
+					} else {
+						log.Printf("Failed to parse chromedp HTML for %s: %v", reqURL, parseErr)
+					}
+				}
+			}
+		}
+
+		data := s.parseDOM(selection, reqURL)
+		results <- data
+	})
+
+	s.Collector.OnError(func(r *colly.Response, err error) {
+		reqURL := r.Request.URL.String()
+		log.Printf("Error scraping %s (status %d): %v", reqURL, r.StatusCode, err)
+		errs <- ScrapeError{
+			URL: reqURL,
+			Err: fmt.Errorf("status %d: %w", r.StatusCode, err),
+		}
+	})
+
+	for _, urlStr := range s.Config.URLs {
+		if err := s.Collector.Visit(urlStr); err != nil {
+			log.Printf("Visit failed for %s: %v", urlStr, err)
+			errs <- ScrapeError{URL: urlStr, Err: err}
+		}
+	}
+	s.Collector.Wait()
+}
+
+// ScrapeError carries a URL alongside the error that prevented it from
+// producing a result, so callers can associate the failure with the right
+// output path.
+type ScrapeError struct {
+	URL string
+	Err error
+}
+
+// -----------------------------------------------------------------------------
+// PARSER / CALLBACK SETUP
+// -----------------------------------------------------------------------------
+
+func (s *Scraper) setupCallbacks() {
+	s.Collector.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
+		newHost := req.URL.Hostname()
+		allowed := false
+		for _, d := range s.Collector.AllowedDomains {
+			if d == newHost {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			log.Printf("Adding redirect domain to AllowedDomains: %s", newHost)
+			s.Collector.AllowedDomains = append(s.Collector.AllowedDomains, newHost)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	})
+
+	s.Collector.OnHTML("html", func(e *colly.HTMLElement) {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("RECOVERED panic in OnHTML callback for %s: %v", e.Request.URL, r)
-				// Still try to parse the static DOM so we get SOMETHING
 				data := s.parseDOM(e.DOM, e.Request.URL.String())
 				s.mu.Lock()
 				s.Results = append(s.Results, data)
@@ -175,13 +315,12 @@ func (s *Scraper) setupCallbacks() {
 		requiresJSFallback := false
 		selection := e.DOM
 
-		// 1. JS HEURISTICS
+		// JS-detection heuristics
 		if s.Config.TargetSelector != "" {
 			if e.DOM.Find(s.Config.TargetSelector).Length() == 0 {
 				requiresJSFallback = true
 			}
 		} else {
-			// FIX (Bug 5): Raise threshold and require noscript/framework markers
 			bodyText := strings.TrimSpace(e.DOM.Find("body").Text())
 			hasJSFrameworkMarker := e.DOM.Find(`div#root, div#app, div#__next, div[data-reactroot]`).Length() > 0
 			if len(bodyText) < 200 && hasJSFrameworkMarker {
@@ -189,31 +328,32 @@ func (s *Scraper) setupCallbacks() {
 			}
 		}
 
-		// 2. LIGHTPANDA WORKFLOW TRIGGER
+		// chromedp fallback — only attempted when a binary is configured
 		if requiresJSFallback {
-			log.Printf("JS rendering needed for %s — handing off to Lightpanda...", reqURL)
-			renderedHTML, err := s.fetchWithLightpanda(reqURL)
-			if err != nil {
-				log.Printf("Lightpanda fallback failed for %s: %v — using static HTML", reqURL, err)
-			} else if renderedHTML != "" {
-				doc, parseErr := goquery.NewDocumentFromReader(strings.NewReader(renderedHTML))
-				if parseErr == nil {
-					// Use doc.Find("html") to get the <html> element specifically,
-					// matching what Colly's e.DOM provides
-					htmlSel := doc.Find("html")
-					if htmlSel.Length() > 0 {
-						selection = htmlSel
+			if s.allocatorCtx == nil {
+				log.Printf("JS rendering needed for %s but no Chrome binary configured — using static HTML", reqURL)
+			} else {
+				log.Printf("JS rendering needed for %s — handing off to chromedp...", reqURL)
+				renderedHTML, err := s.fetchWithChromedp(reqURL)
+				if err != nil {
+					log.Printf("chromedp fallback failed for %s: %v — using static HTML", reqURL, err)
+				} else if renderedHTML != "" {
+					doc, parseErr := goquery.NewDocumentFromReader(strings.NewReader(renderedHTML))
+					if parseErr == nil {
+						htmlSel := doc.Find("html")
+						if htmlSel.Length() > 0 {
+							selection = htmlSel
+						} else {
+							selection = doc.Selection
+						}
+						log.Printf("chromedp successfully rendered %s", reqURL)
 					} else {
-						selection = doc.Selection
+						log.Printf("Failed to parse chromedp HTML for %s: %v", reqURL, parseErr)
 					}
-					log.Printf("Lightpanda successfully rendered %s", reqURL)
-				} else {
-					log.Printf("Failed to parse Lightpanda HTML for %s: %v", reqURL, parseErr)
 				}
 			}
 		}
 
-		// 3. UNIFIED DOM PARSING
 		data := s.parseDOM(selection, reqURL)
 		s.mu.Lock()
 		s.Results = append(s.Results, data)
@@ -222,7 +362,6 @@ func (s *Scraper) setupCallbacks() {
 
 	s.Collector.OnError(func(r *colly.Response, err error) {
 		log.Printf("Error scraping %s (status %d): %v", r.Request.URL, r.StatusCode, err)
-		// FIX (Bug 2): Capture the error so Scrape() can report it
 		s.mu.Lock()
 		s.errors = append(s.errors, fmt.Errorf("%s (status %d): %w", r.Request.URL, r.StatusCode, err))
 		s.mu.Unlock()
@@ -291,76 +430,16 @@ func (s *Scraper) parseDOM(doc *goquery.Selection, reqURL string) ScrapedData {
 }
 
 // -----------------------------------------------------------------------------
-// LIGHTPANDA CDP LOGIC
+// CHROMEDP JS RENDERING
 // -----------------------------------------------------------------------------
 
-// FIX (Bug 3): Discover the correct WebSocket URL from Lightpanda's HTTP API
-func (s *Scraper) discoverCDPEndpoint(baseURL string) (string, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	// Try /json/version first (browser-level WebSocket URL)
-	resp, err := client.Get(baseURL + "/json/version")
-	if err != nil {
-		return "", fmt.Errorf("could not reach Lightpanda at %s: %w", baseURL, err)
-	}
-	defer resp.Body.Close()
-
-	var versionInfo struct {
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&versionInfo); err != nil {
-		return "", fmt.Errorf("failed to parse /json/version: %w", err)
-	}
-
-	if versionInfo.WebSocketDebuggerURL != "" {
-		log.Printf("Discovered Lightpanda WebSocket URL: %s", versionInfo.WebSocketDebuggerURL)
-		return versionInfo.WebSocketDebuggerURL, nil
-	}
-
-	// Fallback: try /json to get a page-level endpoint
-	resp2, err := client.Get(baseURL + "/json")
-	if err != nil {
-		return "", fmt.Errorf("failed to query /json: %w", err)
-	}
-	defer resp2.Body.Close()
-
-	var targets []struct {
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-	}
-	if err := json.NewDecoder(resp2.Body).Decode(&targets); err != nil {
-		return "", fmt.Errorf("failed to parse /json: %w", err)
-	}
-
-	if len(targets) > 0 && targets[0].WebSocketDebuggerURL != "" {
-		log.Printf("Discovered Lightpanda page WebSocket URL: %s", targets[0].WebSocketDebuggerURL)
-		return targets[0].WebSocketDebuggerURL, nil
-	}
-
-	return "", fmt.Errorf("no WebSocket URL found from Lightpanda at %s", baseURL)
-}
-
-func (s *Scraper) fetchWithLightpanda(targetURL string) (string, error) {
-	cdpURL := os.Getenv("LIGHTPANDA_CDP_URL") // direct WS override still works
-	if cdpURL == "" {
-		// Use the config-resolved HTTP base URL for discovery
-		httpBase := s.Config.LightpandaURL
-		if httpBase == "" {
-			httpBase = "http://127.0.0.1:9222"
-		}
-
-		discovered, err := s.discoverCDPEndpoint(httpBase)
-		if err != nil {
-			return "", fmt.Errorf("CDP endpoint discovery failed: %w", err)
-		}
-		cdpURL = discovered
-	}
-
-	log.Printf("Connecting to Lightpanda CDP at: %s", cdpURL)
-
-	allocatorCtx, cancel := chromedp.NewRemoteAllocator(context.Background(), cdpURL)
-	defer cancel()
-
-	ctx, cancelCtx := chromedp.NewContext(allocatorCtx)
+// fetchWithChromedp spawns a new browser context from the shared allocator,
+// navigates to targetURL, waits for the page to settle, and returns the
+// fully-rendered outer HTML.
+func (s *Scraper) fetchWithChromedp(targetURL string) (string, error) {
+	// Each call gets its own browser context (tab) but shares the allocator
+	// process, so we avoid the per-URL startup cost.
+	ctx, cancelCtx := chromedp.NewContext(s.allocatorCtx)
 	defer cancelCtx()
 
 	ctx, cancelTimeout := context.WithTimeout(ctx, 30*time.Second)
@@ -369,7 +448,7 @@ func (s *Scraper) fetchWithLightpanda(targetURL string) (string, error) {
 	var htmlContent string
 	var actions []chromedp.Action
 
-	// 1. INJECT COOKIES (only if we have them — skip if Lightpanda doesn't support it)
+	// Inject cookies collected by Colly so authenticated pages render correctly
 	collyCookies := s.Collector.Cookies(targetURL)
 	if len(collyCookies) > 0 {
 		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
@@ -379,14 +458,11 @@ func (s *Scraper) fetchWithLightpanda(targetURL string) (string, error) {
 					WithPath(c.Path).
 					WithSecure(c.Secure).
 					WithHTTPOnly(c.HttpOnly)
-
 				if !c.Expires.IsZero() {
 					exp := cdp.TimeSinceEpoch(c.Expires)
 					expr = expr.WithExpires(&exp)
 				}
-
 				if err := expr.Do(ctx); err != nil {
-					// FIX: Don't fail the whole operation if one cookie fails
 					log.Printf("Warning: couldn't inject cookie '%s': %v", c.Name, err)
 				}
 			}
@@ -394,29 +470,24 @@ func (s *Scraper) fetchWithLightpanda(targetURL string) (string, error) {
 		}))
 	}
 
-	// 2. NAVIGATE
 	actions = append(actions, chromedp.Navigate(targetURL))
 
-	// 3. WAIT
 	if s.Config.TargetSelector != "" {
 		actions = append(actions, chromedp.WaitVisible(s.Config.TargetSelector, chromedp.ByQuery))
 	} else {
 		actions = append(actions, chromedp.WaitReady("body", chromedp.ByQuery))
 	}
 
-	// 4. EXTRACT
 	actions = append(actions, chromedp.OuterHTML("html", &htmlContent, chromedp.ByQuery))
 
-	err := chromedp.Run(ctx, actions...)
-	if err != nil {
+	if err := chromedp.Run(ctx, actions...); err != nil {
 		return "", fmt.Errorf("chromedp.Run failed: %w", err)
 	}
-
 	return htmlContent, nil
 }
 
 // -----------------------------------------------------------------------------
-// COOKIE PROCESSING LOGIC
+// COOKIE PROCESSING
 // -----------------------------------------------------------------------------
 
 func (s *Scraper) loadAndSetCookies(path string) error {
@@ -440,14 +511,12 @@ func (s *Scraper) loadAndSetCookies(path string) error {
 			domainCookies[d] = append(domainCookies[d], c)
 		}
 	}
-
 	for domain, cs := range domainCookies {
 		urlStr := "https://" + domain
 		if err := s.Collector.SetCookies(urlStr, cs); err != nil {
 			log.Printf("Warning: couldn't set cookies for %s: %v", domain, err)
 		}
 	}
-
 	return nil
 }
 
@@ -477,7 +546,7 @@ func parseNetscapeCookies(content string) ([]*http.Cookie, error) {
 }
 
 // -----------------------------------------------------------------------------
-// LOGIC HELPERS
+// RESOURCE INLINING / OUTPUT HELPERS
 // -----------------------------------------------------------------------------
 
 func (s *Scraper) extractMediaAttribute(linkTag string) string {

@@ -1,11 +1,2 @@
-# ~/.goodies.yaml
-lightpanda:
-  # PC (local Docker):  http://127.0.0.1:9222
-  # Mac (Tailscale):    http://100.x.y.z:9222
-  url: "http://127.0.0.1:9222"
-
-# You can add more later:
-# defaults:
-#   user_agent: "Mozilla/5.0 (Compatible; Goodies/1.0)"
-#   format: "md"
-#   parallelism: 2
+chrome:
+    bin: C:\Users\drewg\AppData\Local\imput\Helium\Application\chrome.exe

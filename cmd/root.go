@@ -16,25 +16,23 @@ import (
 )
 
 var (
-	outputFile    string
-	recursive     bool
-	selector      string
-	userAgent     string
-	format        string
-	cookieFile    string
-	lightpandaURL string // NEW
+	outputFile string
+	recursive  bool
+	selector   string
+	userAgent  string
+	format     string
+	cookieFile string
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "goodies [URL|FILE|DIR] [command]",
 	Short: "Goodies: The All-in-One Scraper & Converter",
-	Long: `Goodies allows you to scrape web pages, extract content, 
-inline resources, and convert HTML to Markdown.
+	Long: `Goodies allows you to scrape web pages, resources, and convert files.
 
 Examples:
   goodies https://example.com -f md
   goodies batch urls.txt -d ./out
-  goodies https://example.com --lightpanda-url http://100.78.42.10:9222`,
+  goodies setbinary "C:\Program Files\Google\Chrome\Application\chrome.exe"`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runRoot,
 }
@@ -44,10 +42,8 @@ func Execute() error {
 }
 
 func init() {
-	// Initialize config BEFORE flag parsing
 	cobra.OnInitialize(initConfig)
 
-	// Local flags
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file path")
 	rootCmd.Flags().BoolVarP(&recursive, "recursive", "r", false, "Recursively process directories")
 	rootCmd.Flags().StringVarP(&selector, "selector", "s", "", "CSS selector to target")
@@ -56,47 +52,35 @@ func init() {
 	rootCmd.Flags().StringVarP(&format, "format", "f", "complete",
 		"Output format: complete|html|text|json|raw|md")
 
-	// Persistent flags (available to all subcommands including batch)
 	rootCmd.PersistentFlags().StringVarP(&cookieFile, "cookies", "c", "",
 		"Path to cookie file (JSON or Netscape format)")
-	rootCmd.PersistentFlags().StringVar(&lightpandaURL, "lightpanda-url", "",
-		"Lightpanda HTTP base URL (e.g. http://100.x.y.z:9222)")
 
-	// Bind the flag to Viper so config file and env vars also work
-	viper.BindPFlag("lightpanda.url", rootCmd.PersistentFlags().Lookup("lightpanda-url"))
-
-	// Env var: GOODIES_LIGHTPANDA_URL=http://100.x.y.z:9222
+	// Env var override: GOODIES_CHROME_BIN=/usr/bin/chromium
 	viper.SetEnvPrefix("GOODIES")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 }
 
 func initConfig() {
-	// Look for config in home directory and current directory
 	viper.SetConfigName(".goodies")
 	viper.SetConfigType("yaml")
-
-	// Search paths (in order)
 	if home, err := os.UserHomeDir(); err == nil {
 		viper.AddConfigPath(home)
 	}
 	viper.AddConfigPath(".")
-
-	// Read config — not an error if it doesn't exist
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Fprintf(os.Stderr, "Using config: %s\n", viper.ConfigFileUsed())
 	}
 }
 
-// getLightpandaURL resolves the Lightpanda URL from the priority chain
-func getLightpandaURL() string {
-	// Viper already handles the priority:
-	//   flag > env (GOODIES_LIGHTPANDA_URL) > config file
-	if u := viper.GetString("lightpanda.url"); u != "" {
-		return u
-	}
-	// Final fallback
-	return "http://127.0.0.1:9222"
+// getChromeBin resolves the Chrome binary path from the priority chain:
+//
+//	env (GOODIES_CHROME_BIN) > config file (chrome.bin) > "" (disabled)
+//
+// An empty return value means JS rendering is disabled — the scraper will
+// fall back to static HTML for any JS-heavy page.
+func getChromeBin() string {
+	return viper.GetString("chrome.bin")
 }
 
 func runRoot(cmd *cobra.Command, args []string) error {
@@ -141,16 +125,16 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	var finalOutput string
 	scraperFormat := format
 	if format == "md" {
 		scraperFormat = "complete"
 	}
 
+	var finalOutput string
+
 	if isURL {
 		fmt.Fprintf(os.Stderr, "Scraping %s...\n", sourceName)
 		u, _ := url.Parse(sourceName)
-
 		config := &scraper.GollyArgs{
 			URLs:           []string{sourceName},
 			UserAgent:      userAgent,
@@ -159,17 +143,17 @@ func runRoot(cmd *cobra.Command, args []string) error {
 			Parallelism:    2,
 			OutputFormat:   scraperFormat,
 			CookieFile:     cookieFile,
-			LightpandaURL:  getLightpandaURL(), // NEW: pass resolved URL
+			ChromeBin:      getChromeBin(),
 		}
-
 		s := scraper.NewScraper(config)
+		defer s.Close()
+
 		if err := s.Scrape(); err != nil {
 			return err
 		}
 		if len(s.Results) == 0 {
 			return fmt.Errorf("no data scraped")
 		}
-
 		result := s.Results[0]
 		finalOutput = s.GetFormattedString(result, scraperFormat)
 	} else {
@@ -193,6 +177,5 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Println(finalOutput)
 	}
-
 	return nil
 }

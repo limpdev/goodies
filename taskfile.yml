@@ -16,3 +16,8 @@ tasks:
     desc: runs repomix
     cmds:
       - repomix --include "**/*.go" --ignore "ui,docs" --output "./docs/goodies.xml"
+
+  build:
+    desc: runs go build
+    cmds:
+      - go build -o bin/goodies.exe
